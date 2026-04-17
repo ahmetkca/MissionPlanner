@@ -1,8 +1,10 @@
 using log4net;
 using MissionPlanner.ArduPilot;
+using MissionPlanner.Utilities;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Net;
 using System.Reflection;
 using System.Text;
@@ -302,13 +304,114 @@ namespace MissionPlanner.McpBridge
             string vehicleType = null;
             VehicleTypeMap.TryGetValue(mav.cs.firmware, out vehicleType);
 
+            // Fetch metadata from MP's pdef cache
+            string displayName = null;
+            string description = null;
+            string units = null;
+            string unitText = null;
+            object range = null;
+            Dictionary<string, string> values = null;
+            string increment = null;
+            string user = null;
+            Dictionary<string, string> bitmask = null;
+            string rebootRequired = null;
+            string readOnly = null;
+            string @volatile = null;
+            string calibration = null;
+            bool metadataAvailable = false;
+
+            if (vehicleType != null)
+            {
+                displayName = GetMeta(paramName, ParameterMetaDataConstants.DisplayName, vehicleType);
+                description = GetMeta(paramName, ParameterMetaDataConstants.Description, vehicleType);
+                units = GetMeta(paramName, ParameterMetaDataConstants.Units, vehicleType);
+                unitText = GetMeta(paramName, "UnitText", vehicleType);
+                increment = GetMeta(paramName, ParameterMetaDataConstants.Increment, vehicleType);
+                user = GetMeta(paramName, ParameterMetaDataConstants.User, vehicleType);
+                rebootRequired = GetMeta(paramName, ParameterMetaDataConstants.RebootRequired, vehicleType);
+                readOnly = GetMeta(paramName, ParameterMetaDataConstants.ReadOnly, vehicleType);
+                @volatile = GetMeta(paramName, "Volatile", vehicleType);
+                calibration = GetMeta(paramName, "Calibration", vehicleType);
+
+                range = ParseRange(
+                    GetMeta(paramName, ParameterMetaDataConstants.Range, vehicleType));
+                values = ParseKeyValuePairs(
+                    GetMeta(paramName, ParameterMetaDataConstants.Values, vehicleType));
+                bitmask = ParseKeyValuePairs(
+                    GetMeta(paramName, ParameterMetaDataConstants.Bitmask, vehicleType));
+
+                metadataAvailable = displayName != null || description != null ||
+                    units != null || unitText != null || range != null ||
+                    values != null || increment != null || user != null ||
+                    bitmask != null || rebootRequired != null || readOnly != null ||
+                    @volatile != null || calibration != null;
+            }
+
             WriteJson(response, 200, new
             {
                 vehicle_type = vehicleType,
                 name = param.Name,
                 value = param.Value,
-                type = param.Type.ToString()
+                type = param.Type.ToString(),
+                metadata_available = metadataAvailable,
+                display_name = displayName,
+                description,
+                units,
+                unit_text = unitText,
+                range,
+                values,
+                increment,
+                user,
+                bitmask,
+                reboot_required = rebootRequired,
+                read_only = readOnly,
+                @volatile,
+                calibration
             });
+        }
+
+        // ──────────────────────────────── metadata helpers ────────────────────────────────
+
+        private static string GetMeta(string paramName, string metaKey, string vehicleType)
+        {
+            string raw = ParameterMetaDataRepositoryAPMpdef
+                .GetParameterMetaData(paramName, metaKey, vehicleType);
+            return string.IsNullOrEmpty(raw) ? null : raw;
+        }
+
+        private static object ParseRange(string raw)
+        {
+            if (raw == null) return null;
+
+            string[] parts = raw.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2 &&
+                double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out double min) &&
+                double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double max))
+            {
+                return new { min, max };
+            }
+
+            return null;
+        }
+
+        private static Dictionary<string, string> ParseKeyValuePairs(string raw)
+        {
+            if (raw == null) return null;
+
+            var dict = new Dictionary<string, string>();
+            string[] entries = raw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string entry in entries)
+            {
+                int colonIdx = entry.IndexOf(':');
+                if (colonIdx > 0 && colonIdx < entry.Length - 1)
+                {
+                    string key = entry.Substring(0, colonIdx).Trim();
+                    string val = entry.Substring(colonIdx + 1).Trim();
+                    dict[key] = val;
+                }
+            }
+
+            return dict.Count > 0 ? dict : null;
         }
 
         // ──────────────────────────────── response helpers ────────────────────────────────

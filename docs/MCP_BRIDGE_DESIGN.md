@@ -38,10 +38,12 @@
 |  MissionPlanner.exe          |<---->|  Node 24)                     |<---->|  (Claude Code / Codex) |
 |                              |      |                               |      |                        |
 |  - In-process HTTP bridge    | HTTP |  - Translates HTTP -> MCP     |  MCP |  = MCP client          |
-|    (HttpListener)            | JSON |  - Loads apm.pdef.xml         | over |                        |
-|  - Reads MAVLinkParamList    |      |    metadata cache             | HTTP |                        |
+|    (HttpListener)            | JSON |  - Passes through metadata    | over |                        |
+|  - Reads MAVLinkParamList    |      |    from MP bridge             | HTTP |                        |
 |    under reader lock         |      |  - Validates bridge_api_      |      |                        |
 |  - Reads MAV connection state|      |    version on startup         |      |                        |
+|  - Reads pdef metadata via   |      |                               |      |                        |
+|    ParameterMetaDataRepo     |      |                               |      |                        |
 |                              |      |                               |      |                        |
 |  Bound: 127.0.0.1:9999       |      |  Bound: 127.0.0.1:9990        |      |                        |
 +------------------------------+      +-------------------------------+      +------------------------+
@@ -182,22 +184,63 @@ Lightweight dump of every parameter known to MP for the currently-selected MAV.
 
 **Notes:**
 
-- No metadata. No default. No description. The MCP server joins metadata from `apm.pdef.xml`.
+- **Intentionally lightweight** — no metadata, no description, no defaults. Use `GET /params/{name}` for full metadata on a specific parameter.
 - Snapshot taken under the reader lock on `MAVLinkParamList`, then released before serialization. See §5.
 - Order: insertion order (which is roughly the order params were received).
 
 #### `GET /params/{name}`
 
-Single-parameter live snapshot.
+Single-parameter live snapshot **with full metadata** from MP's pdef cache.
 
-**Response (200) — found:**
+**Response (200) — found, metadata available:**
 
 ```json
 {
-  "vehicle_type": "ArduCopter",
-  "name": "ACRO_BAL_PITCH",
-  "value": 1.0,
-  "type": "MAV_PARAM_TYPE_REAL32"
+  "vehicle_type": "ArduPlane",
+  "name": "SERVO1_FUNCTION",
+  "value": 4.0,
+  "type": "INT16",
+  "metadata_available": true,
+  "display_name": "Servo output function",
+  "description": "Function assigned to this servo. Setting this to Disabled(0) will setup this output for control by auto missions or MAVLink servo set commands. any other value will enable the corresponding function",
+  "units": null,
+  "unit_text": null,
+  "range": null,
+  "values": { "-1": "GPIO", "0": "Disabled", "4": "Aileron", "6": "MountPan" },
+  "increment": null,
+  "user": "Standard",
+  "bitmask": null,
+  "reboot_required": "True",
+  "read_only": null,
+  "volatile": null,
+  "calibration": null
+}
+```
+
+**Response (200) — found, metadata not available:**
+
+When the parameter exists on the vehicle but has no pdef entry (e.g., custom/vendor params), all metadata fields are `null` and `metadata_available` is `false`. The value and type are still returned.
+
+```json
+{
+  "vehicle_type": "ArduPlane",
+  "name": "CUSTOM_PARAM",
+  "value": 42.0,
+  "type": "REAL32",
+  "metadata_available": false,
+  "display_name": null,
+  "description": null,
+  "units": null,
+  "unit_text": null,
+  "range": null,
+  "values": null,
+  "increment": null,
+  "user": null,
+  "bitmask": null,
+  "reboot_required": null,
+  "read_only": null,
+  "volatile": null,
+  "calibration": null
 }
 ```
 
@@ -209,8 +252,30 @@ Single-parameter live snapshot.
 
 **Response (503) — not connected:** same shape as `/params`.
 
+**Metadata field semantics:**
+
+| Field | Type | Source | Example |
+|---|---|---|---|
+| `metadata_available` | `bool` | `true` if any metadata field is non-null | `true` |
+| `display_name` | `string?` | pdef `humanName` attribute | `"Servo output function"` |
+| `description` | `string?` | pdef `documentation` attribute | long text |
+| `units` | `string?` | pdef `Units` field (short code) | `"m/s"`, `"degC"` |
+| `unit_text` | `string?` | pdef `UnitText` field (human-readable) | `"meters per second"` |
+| `range` | `{ min: number, max: number }?` | pdef `Range` field, parsed to numeric | `{ "min": 0.0, "max": 30.0 }` |
+| `values` | `{ [code]: label }?` | pdef `<values>` children, parsed to map | `{ "0": "Disabled", "4": "Aileron" }` |
+| `increment` | `string?` | pdef `Increment` field | `"0.1"` |
+| `user` | `string?` | pdef `user` attribute | `"Standard"` or `"Advanced"` |
+| `bitmask` | `{ [bit]: label }?` | pdef `Bitmask` field, parsed to map | `{ "0": "Roll", "1": "Pitch" }` |
+| `reboot_required` | `string?` | pdef `RebootRequired` field | `"True"` |
+| `read_only` | `string?` | pdef `ReadOnly` field | `"True"` |
+| `volatile` | `string?` | pdef `Volatile` field | `"True"` |
+| `calibration` | `string?` | pdef `Calibration` field/attribute | `"1"` |
+
 **Notes:**
 
+- Metadata is sourced from `ParameterMetaDataRepositoryAPMpdef.GetParameterMetaData()` — MP's existing pdef XML cache. The bridge does **not** download or parse pdef files itself; it uses what MP already has loaded.
+- `range.min` and `range.max` are always numeric (doubles), never strings.
+- `values` and `bitmask` are key-value maps where keys are the numeric codes as strings and values are human-readable labels.
 - The name path segment is matched **case-sensitive** against `MAVLinkParam.Name`. ArduPilot param names are conventionally upper-snake; agents should preserve case.
 - Single-key indexer on `MAVLinkParamList` is already lock-protected (`ExtLibs/Mavlink/MAVLinkParamList.cs:20-67`). No extra locking needed for this endpoint.
 
@@ -297,36 +362,36 @@ Structural browse over the full param set.
 
 #### `get_param(name)`
 
-Full metadata for one parameter. The MCP server fetches `GET /params/{name}` from MP and joins with metadata loaded from `apm.pdef.xml`.
+Full metadata for one parameter. The MCP server fetches `GET /params/{name}` from the MP bridge, which already includes all metadata from MP's pdef cache. The MCP server passes this through directly — no client-side metadata merging needed.
 
-**Returns:**
+**Returns:** the same shape as the bridge's `GET /params/{name}` response (see §3.4 for full field list).
 
 ```json
 {
-  "name": "ACRO_BAL_PITCH",
-  "value": 1.0,
-  "type": "MAV_PARAM_TYPE_REAL32",
-  "default": 1.0,
-  "description_short": "Acro Balance Pitch",
-  "description_long": "rate at which roll angle returns to level in acro mode...",
+  "vehicle_type": "ArduPlane",
+  "name": "SERVO1_FUNCTION",
+  "value": 4.0,
+  "type": "INT16",
+  "metadata_available": true,
+  "display_name": "Servo output function",
+  "description": "Function assigned to this servo...",
   "units": null,
-  "range": { "min": 0.0, "max": 3.0 },
-  "increment": 0.1,
-  "values": null,
-  "bitmask": null,
+  "unit_text": null,
+  "range": null,
+  "values": { "-1": "GPIO", "0": "Disabled", "4": "Aileron" },
+  "increment": null,
   "user": "Standard",
-  "reboot_required": false,
-  "readonly": false
+  "bitmask": null,
+  "reboot_required": "True",
+  "read_only": null,
+  "volatile": null,
+  "calibration": null
 }
 ```
 
-Where:
-- `values` is `null` for ordinary numeric params, or a `{ "<numeric>": "<label>" }` map when the parameter is an enum (e.g., `GPS_TYPE`).
-- `bitmask` is `null` unless the metadata declares a bitmask, in which case it's a `{ "<bit>": "<label>" }` map.
-
 #### `search_params(query)`
 
-Text search across `name`, `description_short`, `description_long`, and `units` of all known parameters. Case-insensitive substring match.
+Text search across `name`, `display_name`, `description`, and `units` of all known parameters. The MCP server fetches `/params` for the full list, then fetches `/params/{name}` for each candidate to get metadata. Case-insensitive substring match.
 
 **Returns:** same shape as `list_params`, but ranked: name matches first, then description matches.
 
@@ -491,40 +556,40 @@ On startup the MCP server:
 
 ---
 
-## 8. Metadata loading (TS MCP server)
+## 8. Metadata sourcing
 
-Per §6 of our scoping conversation, **MP does not send metadata.** The MCP server loads it itself.
+### MP owns metadata
 
-### Source
+The MP bridge serves parameter metadata directly from MP's existing pdef cache (`ParameterMetaDataRepositoryAPMpdef`). MP downloads and caches `apm.pdef.xml.gz` files from `https://autotest.ardupilot.org/Parameters/{vehicle}/` on startup and refreshes them weekly. The bridge reads from this cache via `GetParameterMetaData()`.
 
-- `https://autotest.ardupilot.org/Parameters/{vehicle}/apm.pdef.xml.gz`
-- `vehicle` is one of `ArduCopter`, `ArduPlane`, `ArduSub`, `Rover`, `AntennaTracker`, etc., derived from `mp_status().vehicle_type`.
+**The MCP server does not download, parse, or cache pdef files.** It passes through whatever the bridge returns.
 
-### Caching
+### Why MP owns it
 
-- Fetch on first need per vehicle type, cache in memory for the life of the MCP server process.
-- Optional disk cache under `~/.cache/missionplanner-mcp-server/` keyed by vehicle + ETag, refreshed on weekly TTL. Not required for MVP.
+- **Single source of truth** — MP already has the correct pdef for the connected vehicle and firmware version. No risk of version mismatch between MP and a separately-fetched pdef.
+- **No duplicate work** — both processes don't need to download and parse the same XML.
+- **Simpler MCP server** — the TS side is a thin translation layer, not a metadata engine.
 
-### Schema
-
-Mirror the keys MP uses in `ParameterMetaDataConstants.cs`:
-`DisplayName`, `Description`, `Units`, `Range`, `Values`, `Increment`, `User`, `RebootRequired`, `Bitmask`, `ReadOnly`.
-
-### Joining
+### Data flow
 
 `get_param(name)` flow:
 
 ```
 agent
-  → MCP server: get_param("ACRO_BAL_PITCH")
-  → MCP server: GET http://127.0.0.1:9999/params/ACRO_BAL_PITCH
-  ← MP: { name, value, type }
-  → MCP server: lookup in metadata cache (vehicle="ArduCopter")
-  → MCP server: merge { ...mp_response, ...metadata }
-  ← agent: full record
+  → MCP server: get_param("SERVO1_FUNCTION")
+  → MCP server: GET http://127.0.0.1:9999/params/SERVO1_FUNCTION
+  ← MP bridge: { name, value, type, metadata_available, display_name, description, ... }
+  ← agent: full record (passed through)
 ```
 
-If metadata is unavailable (offline, network error, parameter not in pdef), the MCP server returns the live record with metadata fields set to `null` and a `metadata_unavailable: true` flag, rather than failing.
+### Metadata fields
+
+All 13 metadata fields from the pdef XML are exposed (see §3.4 for the full list):
+`display_name`, `description`, `units`, `unit_text`, `range`, `values`, `increment`, `user`, `bitmask`, `reboot_required`, `read_only`, `volatile`, `calibration`.
+
+### When metadata is unavailable
+
+If the parameter exists on the vehicle but has no pdef entry (custom/vendor params, or pdef not yet downloaded), all metadata fields are `null` and `metadata_available` is `false`. The value and type are still returned — the bridge never fails a request due to missing metadata.
 
 ---
 
@@ -556,7 +621,7 @@ If metadata is unavailable (offline, network error, parameter not in pdef), the 
 |---|---|---|---|
 | `GET` | `/status` | Health + connection state + version handshake | always |
 | `GET` | `/params` | Full param dump (lightweight) | only when connected |
-| `GET` | `/params/{name}` | One param (lightweight) | only when connected |
+| `GET` | `/params/{name}` | One param + full pdef metadata | only when connected |
 
 ### MCP tools
 
@@ -564,7 +629,7 @@ If metadata is unavailable (offline, network error, parameter not in pdef), the 
 |---|---|
 | `mp_status` | Connection + version + bridge compatibility |
 | `list_params` | Browse params with structural filters |
-| `get_param` | Single param with full metadata |
+| `get_param` | Single param with full metadata (passed through from MP bridge) |
 | `search_params` | Text search across name + description |
 
 ### MCP resources
