@@ -100,6 +100,20 @@ public partial class MAVLink
 
         }
 
+        public MAVLinkParam[] Snapshot()
+        {
+            try
+            {
+                locker.AcquireReaderLock(1000);
+                return this.ToArray();
+            }
+            finally
+            {
+                if (locker.IsReaderLockHeld)
+                    locker.ReleaseReaderLock();
+            }
+        }
+
         public IEnumerable<string> Keys
         {
             get

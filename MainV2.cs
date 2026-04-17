@@ -534,6 +534,7 @@ namespace MissionPlanner
 
         Thread httpthread;
         Thread pluginthread;
+        McpBridge.McpBridgeServer _mcpBridge;
 
         /// <summary>
         /// track the last heartbeat sent
@@ -2102,6 +2103,9 @@ namespace MissionPlanner
 
             joystickthreadrun = false;
 
+            log.Info("closing MCP bridge");
+            try { _mcpBridge?.Stop(); } catch (Exception ex) { log.Warn("MCP bridge shutdown error", ex); }
+
             log.Info("closing httpthread");
 
             // if we are waiting on a socket we need to force an abort
@@ -3236,6 +3240,18 @@ namespace MissionPlanner
             {
                 log.Error("Error starting TCP listener thread: ", ex);
                 CustomMessageBox.Show(ex.ToString());
+            }
+
+            // setup MCP bridge server
+            try
+            {
+                log.Info("start MCP bridge");
+                _mcpBridge = new McpBridge.McpBridgeServer();
+                _mcpBridge.Start();
+            }
+            catch (Exception ex)
+            {
+                log.Error("Error starting MCP bridge: ", ex);
             }
 
             log.Info("start joystick");
