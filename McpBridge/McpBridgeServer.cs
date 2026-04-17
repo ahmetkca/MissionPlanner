@@ -22,6 +22,7 @@ namespace MissionPlanner.McpBridge
         private HttpListener _listener;
         private Thread _listenerThread;
         private volatile bool _running;
+        private readonly ManualResetEvent _shutdownEvent = new ManualResetEvent(false);
         private readonly string _prefix;
 
         private static readonly Dictionary<Firmwares, string> VehicleTypeMap =
@@ -65,7 +66,11 @@ namespace MissionPlanner.McpBridge
             try { _listener?.Close(); } catch { }
 
             if (_listenerThread != null && _listenerThread != Thread.CurrentThread)
-                _listenerThread.Join(2000);
+            {
+                while (!_shutdownEvent.WaitOne(100))
+                    Application.DoEvents();
+                _listenerThread.Join();
+            }
         }
 
         public void Dispose()
@@ -75,26 +80,33 @@ namespace MissionPlanner.McpBridge
 
         private void AcceptLoop()
         {
-            while (_running)
+            try
             {
-                try
+                while (_running)
                 {
-                    var context = _listener.GetContext();
-                    HandleRequest(context);
+                    try
+                    {
+                        var context = _listener.GetContext();
+                        HandleRequest(context);
+                    }
+                    catch (HttpListenerException ex) when (ex.ErrorCode == 995)
+                    {
+                        break; // listener stopped — normal shutdown on Windows
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        break; // listener disposed — normal shutdown
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error("MCP bridge accept loop error", ex);
+                        if (_running) Thread.Sleep(100);
+                    }
                 }
-                catch (HttpListenerException ex) when (ex.ErrorCode == 995)
-                {
-                    break; // listener stopped — normal shutdown on Windows
-                }
-                catch (ObjectDisposedException)
-                {
-                    break; // listener disposed — normal shutdown
-                }
-                catch (Exception ex)
-                {
-                    log.Error("MCP bridge accept loop error", ex);
-                    if (_running) Thread.Sleep(100);
-                }
+            }
+            finally
+            {
+                _shutdownEvent.Set();
             }
         }
 
