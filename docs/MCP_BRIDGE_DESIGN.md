@@ -35,21 +35,24 @@
 ```
 +------------------------------+      +-------------------------------+      +------------------------+
 |  Mission Planner (C#, net472)|      |  MCP server (TypeScript,      |      |  AI coding agent       |
-|  MissionPlanner.exe          |<---->|  Node 24)                     |<---->|  (Claude Code / Codex) |
+|  MissionPlanner.exe          |<---->|  Node 20+)                    |<---->|  (Claude Code / Codex) |
 |                              |      |                               |      |                        |
-|  - In-process HTTP bridge    | HTTP |  - Translates HTTP -> MCP     |  MCP |  = MCP client          |
-|    (HttpListener)            | JSON |  - Passes through metadata    | over |                        |
+|  - In-process HTTP bridge    | HTTP |  - Translates HTTP -> MCP     | stdio|  = MCP client          |
+|    (HttpListener)            | JSON |  - Passes through metadata    |  or  |                        |
 |  - Reads MAVLinkParamList    |      |    from MP bridge             | HTTP |                        |
 |    under reader lock         |      |  - Validates bridge_api_      |      |                        |
 |  - Reads MAV connection state|      |    version on startup         |      |                        |
 |  - Reads pdef metadata via   |      |                               |      |                        |
 |    ParameterMetaDataRepo     |      |                               |      |                        |
 |                              |      |                               |      |                        |
-|  Bound: 127.0.0.1:9999       |      |  Bound: 127.0.0.1:9990        |      |                        |
+|  Bound: 127.0.0.1:9999       |      |  stdio (default) OR           |      |                        |
+|                              |      |  Streamable HTTP on :9990     |      |                        |
 +------------------------------+      +-------------------------------+      +------------------------+
-       (started by user)                    (started by user, separate         (started by user;
-                                             process; survives MP restart)      configured w/ URL of
-                                                                                MCP server)
+       (started by user)                    (stdio: agent spawns via          (spawns MCP server via
+                                             `npx`, one instance per           `cmd /c npx ...` for
+                                             agent session.                    stdio mode, or config-
+                                             HTTP: user runs manually,         ured with URL for HTTP
+                                             shared across agents.)            mode.)
 ```
 
 **Key design choice:** the HTTP API exposed by MP is **not MCP**. It is a small, MP-private JSON contract designed for what's convenient to emit from `MainV2.comPort.MAV.param`. The MCP server is the adapter that maps that contract onto MCP tools and resources. This means:
@@ -307,8 +310,36 @@ Codes used in MVP:
 
 ### 4.1 Transport to the agent
 
-- **Streamable HTTP** on `127.0.0.1:9990` (separate from the MP bridge port).
-- The agent is configured with the URL — neither MP nor the agent spawn the MCP server.
+The MCP server supports **two transports**, selected via a CLI flag:
+
+- **`--transport stdio`** (default) — JSON-RPC over stdin/stdout. The agent (e.g., Claude Code) spawns the MCP server as a child process per agent session. This is the default everywhere MCP is documented.
+- **`--transport http --port 9990`** — Streamable HTTP on `127.0.0.1:9990` (separate from the MP bridge port). The user starts the server manually; one server instance can be shared across multiple agent sessions and survives if the agent restarts. Useful for debugging with tools like `mcp-inspector`.
+
+Both transports speak the same MCP surface. Only the framing differs.
+
+**Why support both:**
+- stdio is the zero-config default — the agent config just names the command, no port management, no orphaned processes.
+- HTTP is the debug/dev-loop path, and an escape hatch for scenarios where multiple agents want to share a warmed-up process (bridge connection already validated, no startup latency).
+
+**Distribution.** The MCP server is published to npm as `@ahmetkca/missionplanner-mcp-server` (see §7). The typical agent config invokes it via `npx`, e.g. for Claude Code on Windows:
+
+```json
+{
+  "mcpServers": {
+    "missionplanner": {
+      "command": "cmd",
+      "args": ["/c", "npx", "--yes", "@ahmetkca/missionplanner-mcp-server"]
+    }
+  }
+}
+```
+
+**Windows gotchas** (observed during implementation, worth preserving for contributors):
+- The entry point (`dist/index.js`) must have `#!/usr/bin/env node` as its first line, otherwise npm on Windows cannot generate a functional `.cmd` shim and the launcher fails with `'missionplanner-mcp-server' is not recognized as an internal or external command`.
+- The agent must invoke `cmd /c npx ...` rather than `npx` directly — Claude Code on Windows does not resolve `.cmd` shims through PATHEXT without the `cmd /c` wrapper.
+- `npx --yes` is used to auto-accept the first-install confirmation prompt, which would otherwise write to stdout and corrupt the JSON-RPC stream.
+
+**Startup compatibility check.** On startup, the MCP server calls `GET /status` once, parses `bridge_api_version`, and compares against its declared range (`>=0.1.0 <1.0.0` pre-1.0). On mismatch **or** if the bridge is unreachable, the server **logs a warning to stderr and still starts** — individual tool calls then fail at invocation time with the specific error. This is softer than refusing to serve; the rationale is that an agent should be able to introspect `mp_status` to learn what's wrong, even when other tools aren't viable. See follow-up notes in §9.
 
 ### 4.2 Tools
 
@@ -340,7 +371,7 @@ If the MCP server cannot reach MP at all, returns:
 { "bridge_compatible": false, "error": "mp_unreachable", "message": "..." }
 ```
 
-#### `list_params(prefix?, changed_from_default?, limit?, cursor?)`
+#### `list_params(prefix?, limit?, cursor?)`
 
 Structural browse over the full param set.
 
@@ -348,17 +379,32 @@ Structural browse over the full param set.
 
 ```json
 {
-  "prefix": { "type": "string", "description": "Filter by name prefix (e.g., 'GPS_')" },
-  "changed_from_default": { "type": "boolean", "description": "Only return params whose value differs from default" },
+  "prefix": { "type": "string", "description": "Filter by name prefix, case-sensitive (e.g., 'GPS_', 'SERVO1')" },
   "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 },
-  "cursor": { "type": "string", "description": "Opaque cursor from the previous response" }
+  "cursor": { "type": "string", "description": "Opaque (base64-encoded index) cursor from the previous response's next_cursor" }
 }
 ```
 
-**Returns:** `{ params: [{ name, value, type, default? }], next_cursor: string | null }`
+**Returns:**
 
-- `default` is included when known from metadata; otherwise omitted.
+```json
+{
+  "vehicle_type": "ArduPlane",
+  "params_loaded": 1132,
+  "params_total": 1132,
+  "filtered_count": 18,
+  "params": [
+    { "name": "ARSPD_PRIMARY", "value": 0, "type": "INT8" },
+    { "name": "ARSPD_OPTIONS", "value": 11, "type": "INT32" }
+  ],
+  "next_cursor": "NQ=="
+}
+```
+
+- `filtered_count` is the total number of parameters matching `prefix` (before pagination).
+- `next_cursor` is `null` when the page is the last.
 - Filtering and pagination happen entirely in the MCP server (the bridge always returns the full set).
+- **No `default` field** — ArduPilot defaults are not available in pdef XML or via any reliable published source, so `changed_from_default` and `default` were dropped for MVP. See `docs/adrs/0004-drop-changed-from-default.md`.
 
 #### `get_param(name)`
 
@@ -397,8 +443,14 @@ Text search across `name`, `display_name`, `description`, and `units` of all kno
 
 ### 4.3 Resources
 
-- **`params://current`** — single resource. Body is the full result of `list_params()` with no filter. Useful for "load the entire param set into context" agent flows.
-- **`param://{name}`** — resource template. Resolving it returns the same payload as `get_param(name)`. Agents can construct URIs themselves; no enumeration needed.
+All resources use a custom URI scheme `ardupilot-missionplanner://` so the origin is unambiguous in agent UIs that list resources from many servers.
+
+- **`ardupilot-missionplanner://vehicle/params`** — single static resource. Body is the full lightweight param list (same shape as `GET /params` from the bridge, unpaginated). Useful for "load the entire param set into context" agent flows.
+- **`ardupilot-missionplanner://vehicle/params/{name}`** — resource template. Resolving it returns the same payload as `get_param(name)` (full pdef metadata). Agents can construct URIs themselves; no enumeration needed.
+
+The template resource also registers two discovery callbacks:
+- **`list`** — enumerates all known parameters as resources (name, current value, type) so agents can browse without calling a tool first.
+- **`complete` on the `{name}` parameter** — prefix autocomplete over known param names (top 20 matches, uppercase prefix). Lets agents drive a picker UX.
 
 These are not the only way to read params — they are an alternative entry point for clients that prefer resource browsing over tool invocation.
 
@@ -524,7 +576,7 @@ try { _mcpBridge?.Stop(); } catch (Exception ex) { log.Warn("MCP bridge shutdown
 ### Repos
 
 - **MissionPlanner fork:** `https://github.com/ahmetkca/MissionPlanner` — branch `feat/mcp-bridge`. Tagged with semver as we ship.
-- **MCP server:** `https://github.com/ahmetkca/missionplanner-mcp-server` (TBD). Independently semver-tagged.
+- **MCP server:** `https://github.com/ahmetkca/missionplanner-mcp-server`. Independently semver-tagged. Published to npm as `@ahmetkca/missionplanner-mcp-server` (current: `0.1.1`).
 
 ### What's versioned
 
@@ -548,11 +600,14 @@ On startup the MCP server:
 
 1. `GET /status` from MP.
 2. Parses `bridge_api_version`.
-3. Compares against its declared range (e.g., `"^0.1.0"` while pre-1.0 — note that npm/semver treats `^0.x.y` as caret-locked to `0.x.*`, so this means "any 0.1.x").
-4. If incompatible:
-   - Logs a clear error including both versions.
-   - Continues to serve `mp_status` (which surfaces `bridge_compatible: false`).
-   - **Refuses** to serve `list_params`, `get_param`, `search_params` — those tools return an error result instructing the agent to update one side.
+3. Compares against its declared range (currently `>=0.1.0 <1.0.0`, i.e. "any 0.1.x pre-1.0; will tighten to caret-lock post-1.0").
+4. On mismatch **or** bridge unreachable:
+   - Logs a warning to stderr (both versions included).
+   - **Continues to start** — the server does not refuse to register its tools.
+   - `mp_status` surfaces the specific failure via `bridge_compatible: false` + `reason`.
+   - Other tools (`list_params`, `get_param`, `search_params`) then fail at invocation time with the underlying HTTP/fetch error.
+
+> **Known follow-up:** the DESIGN originally specified that incompatible tools should be pre-emptively refused with a clean "update one side" message rather than failing at call time. That stricter behavior is intentionally deferred — the current behavior is chosen so an agent can always introspect `mp_status` and learn what's wrong. Will revisit when we have real-world incompatibility scenarios to test against.
 
 ---
 
@@ -601,15 +656,24 @@ If the parameter exists on the vehicle but has no pdef entry (custom/vendor para
 2. **Thread-safe snapshot:** add a public `Snapshot()` method to `MAVLinkParamList` that acquires the reader lock, copies, and returns. Keeps locking encapsulated.
 3. **Vehicle-type derivation:** static `Dictionary<Firmwares, string>` in the bridge module. Enum values from `ExtLibs/ArduPilot/Firmwares.cs`: `ArduPlane`→`"ArduPlane"`, `ArduCopter2`→`"ArduCopter"`, `ArduRover`→`"Rover"`, `ArduSub`→`"ArduSub"`, `ArduTracker`→`"AntennaTracker"`. Others → `null`.
 4. **Port collision:** log and disable for MVP. No fallback ports, no discovery file.
-5. **MCP transport:** Streamable HTTP. Will verify Claude Code config syntax when we reach TS integration.
+5. **MCP transport:** Dual — stdio (default, agent-spawned) + Streamable HTTP (optional, user-run). See §4.1 and `docs/adrs/0003-dual-transport-stdio-http.md`.
 6. **Lifecycle hooks:** `OnLoad` for startup (established pattern — existing `httpserver` starts there at ~line 3228). `FormClosing` for shutdown.
 7. **JSON serialization:** `Newtonsoft.Json` 13.0.3 already in `MissionPlanner.csproj` and used across the codebase. No new dependencies.
 8. **Implementation order:** C# HTTP bridge first (MP side), then TS MCP server. Bridge must exist for the MCP server to test against.
+9. **`vehicle_firmware` sourcing:** `MAVState.VersionString` (already populated from `AUTOPILOT_VERSION` / `STATUSTEXT` during handshake). Verified against a live ArduPlane V4.6.3 connection.
+10. **`BaseStream.PortName` availability:** confirmed present on all `ICommsSerial` implementations used by MP (CommsSerial, CommsFile, CommsTCP, CommsUDP). Non-COM implementations return a synthetic name (e.g., `"TCP"`) rather than null.
+11. **Shutdown signaling:** `ManualResetEvent` + `WaitOne(100)` + `Application.DoEvents()` in `Stop()`, `_shutdownEvent.Set()` in accept-loop `finally`. Aligns with MP's codebase convention rather than a naked `Thread.Join(2000)`.
+12. **Metadata exposure:** all 13 pdef fields surfaced (`display_name`, `description`, `units`, `unit_text`, `range`, `values`, `increment`, `user`, `bitmask`, `reboot_required`, `read_only`, `volatile`, `calibration`). `range.min/max` always numeric doubles. See §3.4.
+13. **Defaults:** dropped from MVP — ArduPilot defaults are not in pdef XML, `defaults.parm` URLs don't exist on the ArduPilot CDN, and computing defaults from firmware source at runtime is out of scope. See `docs/adrs/0004-drop-changed-from-default.md`.
 
-### Remaining (to address during implementation)
+### Remaining (post-MVP follow-ups)
 
-- Exact `vehicle_firmware` field sourcing — need to locate where MP stores the `AUTOPILOT_VERSION` response text. May simplify to `null` for MVP if it's hard to reach.
-- `BaseStream.PortName` availability — confirm this property exists on all `ICommsSerial` implementations MP uses (TCP, UDP serial don't have a COM port name).
+- **Writes** (`POST /params/{name}`). Primary near-term goal — see roadmap in `ARCHITECTURE.md`.
+- **Resource pagination.** The `ardupilot-missionplanner://vehicle/params` static resource currently returns all ~1132 params in one JSON body. Consider chunked resources or filtering.
+- **Stricter compatibility gating.** See §7.
+- **Test coverage.** The C# bridge has zero unit tests; the MCP server has zero unit tests. Need at least smoke tests against a mock bridge.
+- **Multi-vehicle.** Everything assumes `MainV2.comPort.MAV` (single currently-selected vehicle). Expanding to `MAVlist[sysid,compid]` enumeration is a contract-breaking change.
+- **Live updates.** Polling is fine for params (they change rarely); telemetry will need SSE / WebSocket.
 
 ---
 
@@ -636,8 +700,8 @@ If the parameter exists on the vehicle but has no pdef entry (custom/vendor para
 
 | URI | Shape |
 |---|---|
-| `params://current` | Full param list |
-| `param://{name}` | One param + metadata |
+| `ardupilot-missionplanner://vehicle/params` | Full lightweight param list (name, value, type) |
+| `ardupilot-missionplanner://vehicle/params/{name}` | One param + full pdef metadata (template with `list` + `complete` callbacks) |
 
 ### Versions in play
 
@@ -676,18 +740,33 @@ Other        → null
 AP_Periph    → null
 ```
 
-### HttpListener accept loop pattern (decided)
+### HttpListener accept loop pattern (shipped)
 
-- **Blocking `GetContext()`** on a dedicated `Thread` with `IsBackground = true`
-- **Shutdown:** set `_running = false` → `Stop()` → `Close()` → `Join(2000)`
-- Catch `HttpListenerException` code 995 (interrupted) + `ObjectDisposedException` in accept loop
-- All handler exceptions caught → return HTTP 500 → never crash MP
-- Full skeleton: see `docs/HTTPLISTENER_FEASIBILITY.md`
+- **Blocking `GetContext()`** on a dedicated `Thread` with `IsBackground = true`.
+- **Shutdown:** `_running = false` → `_listener.Stop()` / `Close()` → `_shutdownEvent.WaitOne(100)` loop with `Application.DoEvents()` → `Thread.Join()`. The `ManualResetEvent` is set in the accept loop's `finally` block. Rationale: matches MP's codebase convention for cooperative background-thread shutdown, keeps the UI responsive during teardown.
+- Catches `HttpListenerException` code 995 (interrupted) + `ObjectDisposedException` in the accept loop.
+- All handler exceptions caught → return HTTP 500 → never crash MP.
+- Full skeleton: see `docs/HTTPLISTENER_FEASIBILITY.md`.
 
-### Files to create/modify for implementation
+### Files created/modified (MVP, shipped on branch `feat/mcp-bridge`)
 
 | Action | File | What |
 |---|---|---|
-| **Create** | `McpBridge/McpBridgeServer.cs` | HttpListener server + route handlers |
-| **Modify** | `ExtLibs/Mavlink/MAVLinkParamList.cs` | Add `Snapshot()` method (~8 lines) |
-| **Modify** | `MainV2.cs` | Add field, start in `OnLoad` (~line 3234), stop in `FormClosing` (~line 2108) |
+| **Created** | `McpBridge/McpBridgeServer.cs` | HttpListener server + three route handlers + metadata enrichment via `ParameterMetaDataRepositoryAPMpdef` |
+| **Modified** | `ExtLibs/Mavlink/MAVLinkParamList.cs` | Added `Snapshot()` method |
+| **Modified** | `MainV2.cs` | Start bridge in `OnLoad` alongside existing httpserver, stop in `FormClosing` |
+
+### MCP server files (shipped in `ahmetkca/missionplanner-mcp-server`, published as `@ahmetkca/missionplanner-mcp-server@0.1.1`)
+
+| File | What |
+|---|---|
+| `src/index.ts` | Entry point — CLI parsing, dual-transport startup (stdio / Streamable HTTP), graceful shutdown |
+| `src/server.ts` | `McpServer` factory — wires tools + resources to the `BridgeClient` |
+| `src/bridge-client.ts` | Typed HTTP client for the MP bridge — `getStatus`, `getParams`, `getParam`, `checkCompatibility` |
+| `src/semver.ts` | Minimal semver parse + range check (no runtime dependency) |
+| `src/tools/mp-status.ts` | `mp_status` tool |
+| `src/tools/list-params.ts` | `list_params` tool (prefix filter + base64-cursor pagination) |
+| `src/tools/get-param.ts` | `get_param` tool (passthrough to bridge) |
+| `src/tools/search-params.ts` | `search_params` tool (name substring → metadata fetch → description search) |
+| `src/resources/params-current.ts` | Static resource `ardupilot-missionplanner://vehicle/params` |
+| `src/resources/param-by-name.ts` | Resource template `ardupilot-missionplanner://vehicle/params/{name}` + `list` + `complete` callbacks |
