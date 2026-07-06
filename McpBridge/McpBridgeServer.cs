@@ -5,6 +5,7 @@ using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Net;
 using System.Reflection;
 using System.Text;
@@ -18,7 +19,7 @@ namespace MissionPlanner.McpBridge
         private static readonly ILog log =
             LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
 
-        public const string BridgeApiVersion = "0.1.0";
+        public const string BridgeApiVersion = "0.2.0";
         private const string DefaultPrefix = "http://127.0.0.1:9999/";
 
         private HttpListener _listener;
@@ -117,32 +118,41 @@ namespace MissionPlanner.McpBridge
             try
             {
                 string path = context.Request.Url.AbsolutePath.TrimEnd('/');
+                string method = context.Request.HttpMethod;
+                bool isParamByName = path.StartsWith("/params/") && path.Length > "/params/".Length;
 
-                if (context.Request.HttpMethod != "GET")
+                if (method == "GET")
                 {
-                    WriteError(context.Response, 405, "method_not_allowed",
-                        "Only GET is supported");
-                    return;
+                    if (path == "" || path == "/status")
+                    {
+                        HandleStatus(context.Response);
+                    }
+                    else if (path == "/params")
+                    {
+                        HandleParams(context.Response);
+                    }
+                    else if (isParamByName)
+                    {
+                        string paramName = Uri.UnescapeDataString(
+                            path.Substring("/params/".Length));
+                        HandleParamByName(context.Response, paramName);
+                    }
+                    else
+                    {
+                        WriteError(context.Response, 404, "not_found",
+                            "Unknown endpoint: " + path);
+                    }
                 }
-
-                if (path == "" || path == "/status")
-                {
-                    HandleStatus(context.Response);
-                }
-                else if (path == "/params")
-                {
-                    HandleParams(context.Response);
-                }
-                else if (path.StartsWith("/params/") && path.Length > "/params/".Length)
+                else if (method == "POST" && isParamByName)
                 {
                     string paramName = Uri.UnescapeDataString(
                         path.Substring("/params/".Length));
-                    HandleParamByName(context.Response, paramName);
+                    HandlePostParam(context.Request, context.Response, paramName);
                 }
                 else
                 {
-                    WriteError(context.Response, 404, "not_found",
-                        "Unknown endpoint: " + path);
+                    WriteError(context.Response, 405, "method_not_allowed",
+                        "Method " + method + " is not supported on " + path);
                 }
             }
             catch (Exception ex)
@@ -177,6 +187,7 @@ namespace MissionPlanner.McpBridge
                     port = (string)null,
                     vehicle_type = (string)null,
                     vehicle_firmware = (string)null,
+                    armed = (bool?)null,
                     selected_sysid = (int?)null,
                     selected_compid = (int?)null,
                     params_loaded = 0,
@@ -191,6 +202,7 @@ namespace MissionPlanner.McpBridge
             string portName = null;
             string vehicleType = null;
             string vehicleFirmware = null;
+            bool? armed = null;
             int? sysid = null;
             int? compid = null;
             int paramsLoaded = 0;
@@ -212,6 +224,7 @@ namespace MissionPlanner.McpBridge
                 {
                     VehicleTypeMap.TryGetValue(mav.cs.firmware, out vehicleType);
                     vehicleFirmware = mav.VersionString;
+                    armed = mav.cs.armed;
                     paramsLoaded = mav.param.TotalReceived;
                     paramsTotal = mav.param.TotalReported;
                 }
@@ -225,6 +238,7 @@ namespace MissionPlanner.McpBridge
                 port = portName,
                 vehicle_type = vehicleType,
                 vehicle_firmware = vehicleFirmware,
+                armed,
                 selected_sysid = sysid,
                 selected_compid = compid,
                 params_loaded = paramsLoaded,
@@ -370,7 +384,146 @@ namespace MissionPlanner.McpBridge
             });
         }
 
+        private class SetParamRequestBody
+        {
+            public double? value;
+            public double? expected_current_value;
+        }
+
+        private void HandlePostParam(HttpListenerRequest request, HttpListenerResponse response,
+            string paramName)
+        {
+            var port = MainV2.comPort;
+            if (port == null || port.BaseStream == null || !port.BaseStream.IsOpen)
+            {
+                WriteError(response, 503, "not_connected",
+                    "Mission Planner is not connected to a MAVLink COM port");
+                return;
+            }
+
+            var mav = port.MAVlist[port.sysidcurrent, port.compidcurrent];
+            if (mav == null)
+            {
+                WriteError(response, 503, "not_connected",
+                    "No vehicle selected");
+                return;
+            }
+
+            // String indexer is already lock-protected
+            var param = mav.param[paramName];
+            if (param == null)
+            {
+                WriteError(response, 404, "not_found",
+                    "Parameter '" + paramName + "' is not known to the connected vehicle");
+                return;
+            }
+
+            string vehicleType = null;
+            VehicleTypeMap.TryGetValue(mav.cs.firmware, out vehicleType);
+
+            // Only refuse the write when pdef explicitly says read_only. If the vehicle type
+            // can't be resolved there's no metadata signal to check, so we fail open rather
+            // than block a write on a fact we have no way to evaluate.
+            if (vehicleType != null)
+            {
+                string readOnly = GetMeta(paramName, ParameterMetaDataConstants.ReadOnly, vehicleType);
+                if (readOnly != null)
+                {
+                    WriteError(response, 403, "read_only",
+                        "Parameter '" + paramName + "' is marked read-only and cannot be written");
+                    return;
+                }
+            }
+
+            SetParamRequestBody body;
+            try
+            {
+                string raw;
+                using (var reader = new StreamReader(request.InputStream,
+                    request.ContentEncoding ?? Encoding.UTF8))
+                {
+                    raw = reader.ReadToEnd();
+                }
+
+                body = JsonConvert.DeserializeObject<SetParamRequestBody>(raw);
+            }
+            catch (Exception)
+            {
+                WriteError(response, 400, "bad_request", "Request body must be valid JSON");
+                return;
+            }
+
+            if (body == null || !body.value.HasValue || !body.expected_current_value.HasValue)
+            {
+                WriteError(response, 400, "bad_request",
+                    "Body must include numeric 'value' and 'expected_current_value'");
+                return;
+            }
+
+            double requestedValue = body.value.Value;
+            double expectedCurrentValue = body.expected_current_value.Value;
+            double liveValueBeforeWrite = param.Value;
+
+            if (!ValuesApproximatelyEqual(expectedCurrentValue, liveValueBeforeWrite))
+            {
+                WriteJson(response, 409, new
+                {
+                    error = "value_mismatch",
+                    message = "expected_current_value does not match the live value — " +
+                        "re-fetch with get_param before retrying",
+                    current_value = liveValueBeforeWrite
+                });
+                return;
+            }
+
+            try
+            {
+                port.setParam(paramName, requestedValue);
+            }
+            catch (TimeoutException)
+            {
+                WriteError(response, 504, "timeout",
+                    "Timed out waiting for the vehicle to acknowledge the parameter write");
+                return;
+            }
+
+            // setParamAsync replaces the MAVLinkParamList entry in-place on ack; re-index to
+            // read the value the vehicle actually confirmed (may differ if it was clamped).
+            var updatedParam = mav.param[paramName];
+            double appliedValue = updatedParam != null ? updatedParam.Value : requestedValue;
+            bool changed = !ValuesApproximatelyEqual(appliedValue, liveValueBeforeWrite);
+
+            bool rebootRequired = false;
+            if (vehicleType != null)
+            {
+                string rebootRequiredRaw =
+                    GetMeta(paramName, ParameterMetaDataConstants.RebootRequired, vehicleType);
+                rebootRequired = string.Equals(rebootRequiredRaw, "True",
+                    StringComparison.OrdinalIgnoreCase);
+            }
+
+            WriteJson(response, 200, new
+            {
+                name = paramName,
+                requested_value = requestedValue,
+                applied_value = appliedValue,
+                changed,
+                reboot_required = rebootRequired
+            });
+        }
+
         // ──────────────────────────────── metadata helpers ────────────────────────────────
+
+        // MAVLink REAL32 params round-trip through float32 (see MAVLinkParam.GetValue's
+        // 7-significant-digit rounding), so exact double equality is unsafe here.
+        private static bool ValuesApproximatelyEqual(double a, double b)
+        {
+            if (double.IsNaN(a) || double.IsNaN(b)) return false;
+            double diff = Math.Abs(a - b);
+            if (diff < 1e-6) return true;
+            double scale = Math.Max(Math.Abs(a), Math.Abs(b));
+            return diff <= scale * 1e-6;
+        }
 
         private static string GetMeta(string paramName, string metaKey, string vehicleType)
         {

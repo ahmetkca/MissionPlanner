@@ -12,6 +12,7 @@ If you only read two, read `0001` and `0002` — they define the shape of the wh
 | [0002](0002-mp-owns-metadata.md) | Mission Planner owns parameter metadata | Accepted |
 | [0003](0003-dual-transport-stdio-http.md) | MCP server supports both stdio and Streamable HTTP | Accepted |
 | [0004](0004-drop-changed-from-default.md) | Drop `changed_from_default` / `default` from MVP | Accepted |
+| [0005](0005-parameter-write-path.md) | Parameter write path | Accepted |
 
 ## Format
 

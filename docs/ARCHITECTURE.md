@@ -199,13 +199,16 @@ The bridge starts automatically when MP opens and stops when MP closes. No extra
 
 ### Near-term (concrete, scoped)
 
-- **Parameter writes.** `POST /params/{name}` → `PARAM_SET` MAVLink message → wait for `PARAM_VALUE` acknowledgement → return new value. Contract designed in `MCP_BRIDGE_DESIGN.md §3.6`; not enabled in MVP. Requires the MCP server to add a `set_param` tool.
 - **Reliable test coverage.** Zero tests today on either side. Minimum target: the bridge handlers against a stub MP (via `ICommsSerial` mock), and the MCP server tools against a stub HTTP bridge.
 - **Stricter compatibility gating.** Currently the MCP server warns but still starts on bridge mismatch. Post-MVP: pre-emptively refuse incompatible tools with a "update MP / update the server" message before the agent wastes a turn calling them.
 
+### Shipped since MVP
+
+- **Parameter writes.** `POST /params/{name}` → `PARAM_SET` MAVLink message → wait for `PARAM_VALUE` acknowledgement → return new value, `set_param` MCP tool. Contract in `MCP_BRIDGE_DESIGN.md §3.4`, design rationale in `docs/adrs/0005-parameter-write-path.md`. `bridge_api_version` is now `0.2.0`.
+
 ### Medium-term (design needed)
 
-- **Live telemetry snapshot.** Attitude, battery, GPS fix, flight mode, armed state. Likely `GET /telemetry` returning a point-in-time snapshot; see `MAVState.cs` fields.
+- **Live telemetry snapshot.** Attitude, battery, GPS fix, flight mode. (`armed` already shipped on `GET /status` as part of the write-path work.) Likely `GET /telemetry` returning a point-in-time snapshot; see `MAVState.cs` fields.
 - **Missions / waypoints.** `GET /mission` → waypoint list. Write path (`POST /mission`) is the hard part — needs round-trip confirmation via `MISSION_ACK`.
 - **Resource pagination.** The `ardupilot-missionplanner://vehicle/params` static resource currently returns all params in one body (~1100 entries). Needs chunked resources or a `list` cursor protocol.
 
